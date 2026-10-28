@@ -1,0 +1,186 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// rpcd ucode plugin for pbr-geoip (country-based routing companion for pbr).
+//
+// ubus call luci.pbrgeoip getStatus
+// ubus call luci.pbrgeoip update
+
+'use strict';
+
+import { access, readfile, popen } from 'fs';
+import { cursor } from 'uci';
+
+const statusFile = '/etc/pbr-geoip.status';
+const updater = '/usr/bin/pbr-geoip-update';
+
+// Live per-set hit counters from the running pbr_geoip chain.
+function chainHits() {
+	let hits = {};
+	let chainActive = false;
+	let p = popen('nft -j list chain inet fw4 pbr_geoip 2>/dev/null');
+	if (!p) return { chainActive, hits };
+	let out = p.read('all');
+	p.close();
+	if (!out) return { chainActive, hits };
+	let data;
+	try { data = json(out); } catch (e) { return { chainActive, hits }; }
+	for (let item in data?.nftables) {
+		if (!item?.rule?.expr) continue;
+		chainActive = true;
+		let setname, packets;
+		for (let ex in item.rule.expr) {
+			let right = ex?.match?.right;
+			if (type(right) == 'string' && substr(right, 0, 7) == '@geoip_')
+				setname = substr(right, 1);
+			if (ex?.counter)
+				packets = ex.counter.packets;
+		}
+		if (setname != null && packets != null)
+			hits[setname] = packets;
+	}
+	return { chainActive, hits };
+}
+
+const methods = {
+	getStatus: {
+		call: function() {
+			let uci_ctx = cursor();
+			uci_ctx.load('pbr_geoip');
+			let cfg = {
+				enabled: uci_ctx.get('pbr_geoip', 'global', 'enabled') == '1',
+				countries: uci_ctx.get('pbr_geoip', 'global', 'countries') || '',
+				interface: uci_ctx.get('pbr_geoip', 'global', 'interface') || 'wan',
+				src_addr: uci_ctx.get('pbr_geoip', 'global', 'src_addr') || '',
+			};
+			let st = {};
+			let raw = readfile(statusFile);
+			if (raw) {
+				try { st = json(raw); } catch (e) { st = {}; }
+			}
+			let live = chainHits();
+			return {
+				config: cfg,
+				updated: st.updated || null,
+				mark: st.mark || null,
+				countries: st.countries || {},
+				chainActive: live.chainActive,
+				hits: live.hits,
+				updaterPresent: !!access(updater, 'x'),
+			};
+		}
+	},
+	// Per-policy live hit counters, aggregated by rule comment (pbr writes
+	// the policy name as the comment when nft_rule_counter is enabled).
+	getPolicyHits: {
+		call: function() {
+			let hits = {};
+			let counters = false;
+			for (let chain in ['pbr_prerouting', 'pbr_forward', 'pbr_output', 'pbr_dstnat']) {
+				let p = popen('nft -j list chain inet fw4 ' + chain + ' 2>/dev/null');
+				if (!p) continue;
+				let out = p.read('all');
+				p.close();
+				if (!out) continue;
+				let data;
+				try { data = json(out); } catch (e) { continue; }
+				for (let item in data?.nftables) {
+					let r = item?.rule;
+					if (!r) continue;
+					let packets;
+					for (let ex in r.expr)
+						if (ex?.counter)
+							packets = ex.counter.packets;
+					if (packets == null) continue;
+					counters = true;
+					if (r.comment == null) continue;
+					hits[r.comment] = (hits[r.comment] ?? 0) + packets;
+				}
+			}
+			return { counters: counters, hits: hits };
+		}
+	},
+	update: {
+		call: function() {
+			if (!access(updater, 'x'))
+				return { result: false, error: 'updater not found' };
+			system(updater + ' >> /var/log/pbr-geoip.log 2>&1 &');
+			return { result: true };
+		}
+	},
+	// Toggle pbr's nft_rule_counter/nft_set_counter with a clean restart.
+	// pbr leaves its nft sets behind on stop, and a definition change
+	// (counter on/off) makes the next 'add set' fail with EEXIST, so the
+	// stale sets are dropped between stop and start.
+	setCounters: {
+		args: { rule: 'rule', set: 'set' },
+		call: function(req) {
+			let uci_ctx = cursor();
+			uci_ctx.load('pbr');
+			if (req.args?.rule != null)
+				uci_ctx.set('pbr', 'config', 'nft_rule_counter',
+					req.args.rule == '1' ? '1' : '0');
+			if (req.args?.set != null)
+				uci_ctx.set('pbr', 'config', 'nft_set_counter',
+					req.args.set == '1' ? '1' : '0');
+			uci_ctx.commit('pbr');
+
+			system('/etc/init.d/pbr stop >/dev/null 2>&1');
+			let p = popen('nft -j list sets 2>/dev/null');
+			if (p) {
+				let out = p.read('all');
+				p.close();
+				let data;
+				try { data = json(out); } catch (e) { data = null; }
+				for (let item in data?.nftables) {
+					let s = item?.set;
+					if (!s || s.table != 'fw4') continue;
+					if (match(s.name, /^pbr_[A-Za-z0-9_]+$/))
+						system('nft delete set inet fw4 ' + s.name +
+							' >/dev/null 2>&1');
+				}
+			}
+			system('/etc/init.d/pbr start >/dev/null 2>&1 &');
+			return { result: true };
+		}
+	},
+	setConfig: {
+		args: { enabled: 'enabled', countries: 'countries', interface: 'interface', src_addr: 'src_addr', ipv6: 'ipv6' },
+		call: function(req) {
+			let cc = [];
+			for (let c in split(req.args?.countries || '', ' ')) {
+				c = lc(trim(c));
+				if (match(c, /^[a-z]{2}$/))
+					push(cc, c);
+			}
+			if (length(cc) == 0)
+				return { result: false, error: 'no valid 2-letter country codes' };
+
+			let iface = trim(req.args?.interface || '');
+			if (iface != '' && !match(iface, /^[a-zA-Z0-9_]+$/))
+				return { result: false, error: 'invalid interface name' };
+
+			let src = trim(req.args?.src_addr || '');
+			if (src != '' && !match(src, /^[0-9a-fA-F.:\/ ]+$/))
+				return { result: false, error: 'invalid src_addr' };
+
+			let uci_ctx = cursor();
+			uci_ctx.load('pbr_geoip');
+			if (!uci_ctx.get('pbr_geoip', 'global'))
+				uci_ctx.set('pbr_geoip', 'global', 'pbr_geoip');
+			uci_ctx.set('pbr_geoip', 'global', 'countries', join(' ', cc));
+			if (iface != '')
+				uci_ctx.set('pbr_geoip', 'global', 'interface', iface);
+			uci_ctx.set('pbr_geoip', 'global', 'enabled',
+				req.args?.enabled == '0' ? '0' : '1');
+			uci_ctx.set('pbr_geoip', 'global', 'ipv6',
+				req.args?.ipv6 == '0' ? '0' : '1');
+			if (src != '')
+				uci_ctx.set('pbr_geoip', 'global', 'src_addr', src);
+			else
+				uci_ctx.delete('pbr_geoip', 'global', 'src_addr');
+			uci_ctx.commit('pbr_geoip');
+			return { result: true };
+		}
+	},
+};
+
+return { 'luci.pbrgeoip': methods };

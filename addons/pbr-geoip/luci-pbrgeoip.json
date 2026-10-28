@@ -1,0 +1,14 @@
+{
+	"luci-app-pbr": {
+		"read": {
+			"ubus": {
+				"luci.pbrgeoip": ["getStatus", "getPolicyHits"]
+			}
+		},
+		"write": {
+			"ubus": {
+				"luci.pbrgeoip": ["update", "setConfig", "setCounters"]
+			}
+		}
+	}
+}
